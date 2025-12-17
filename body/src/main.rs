@@ -182,21 +182,22 @@ fn update_hands_and_spawn(
         // スナップ検知で箱を生成
         if packet.snap {
             let rand_x = (time.elapsed_seconds() * 10.0).sin() * 5.0;
+            let box_size = 5.0; 
             commands.spawn((
                 PbrBundle {
-                    mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+                    mesh: meshes.add(Cuboid::new(box_size, box_size, box_size)),
                     material: materials.add(Color::srgb(1.0, 0.5, 0.0)),
                     transform: Transform::from_xyz(rand_x, 15.0, 0.0),
                     ..default()
                 },
                 RigidBody::Dynamic,
-                Collider::cuboid(0.5, 0.5, 0.5),
+                // コライダは半分のサイズを指定
+                Collider::cuboid(box_size / 2.0, box_size / 2.0, box_size / 2.0),
                 Restitution::coefficient(0.5),
             ));
         }
 
-        let mut positions: HashMap<(HandSide, usize), Vec3> = HashMap::new();
-
+        // 座標更新処理
         for (point, mut transform) in query.iter_mut() {
             let target_hand_data = packet.hands.iter().find(|h| {
                 match point.side {
@@ -206,40 +207,54 @@ fn update_hands_and_spawn(
             });
 
             if let Some(hand_data) = target_hand_data {
-                if let Some(lm) = hand_data.landmarks.iter().find(|l| l.id == point.id) {
-                    
-                    let scale = 20.0;
+                let mut depth_offset = 0.0;
+                let wrist = hand_data.landmarks.iter().find(|l| l.id == 0);
+                let middle_mcp = hand_data.landmarks.iter().find(|l| l.id == 9);
 
+                if let (Some(w), Some(m)) = (wrist, middle_mcp) {
+                    let dx = w.x - m.x;
+                    let dy = w.y - m.y;
+                    let hand_size = (dx * dx + dy * dy).sqrt();
+                    depth_offset = 20.0 - (hand_size * 80.0);
+                }
+
+                if let Some(lm) = hand_data.landmarks.iter().find(|l| l.id == point.id) {
+                    let scale = 20.0;
                     let x = (lm.x - 0.5) * scale; 
                     let y = (0.5 - lm.y) * scale + 3.0; 
-                    let z = lm.z * scale + 8.0;
+                    let z = depth_offset + (lm.z * scale);
 
                     let target_pos = Vec3::new(x, y, z);
                     
                     let smooth_factor = 40.0 * time.delta_seconds(); 
                     let t = smooth_factor.clamp(0.0, 1.0);
                     transform.translation = transform.translation.lerp(target_pos, t);
-                    
-                    positions.insert((point.side, point.id), transform.translation);
                 }
             }
         }
+    }
 
-        // ワイヤー描画
-        for side in [HandSide::Right, HandSide::Left] {
-            let color = if side == HandSide::Right { 
-                Color::srgb(0.0, 1.0, 1.0) 
-            } else { 
-                Color::srgb(1.0, 0.0, 1.0) 
-            };
+    let mut current_positions: HashMap<(HandSide, usize), Vec3> = HashMap::new();
 
-            for &(start_idx, end_idx) in HAND_CONNECTIONS {
-                if let (Some(&start), Some(&end)) = (
-                    positions.get(&(side, start_idx)),
-                    positions.get(&(side, end_idx))
-                ) {
-                    gizmos.line(start, end, color);
-                }
+    for (point, transform) in query.iter() {
+        if transform.translation.y > -50.0 {
+            current_positions.insert((point.side, point.id), transform.translation);
+        }
+    }
+
+    for side in [HandSide::Right, HandSide::Left] {
+        let color = if side == HandSide::Right { 
+            Color::srgb(0.0, 1.0, 1.0) 
+        } else { 
+            Color::srgb(1.0, 0.0, 1.0) 
+        };
+
+        for &(start_idx, end_idx) in HAND_CONNECTIONS {
+            if let (Some(&start), Some(&end)) = (
+                current_positions.get(&(side, start_idx)),
+                current_positions.get(&(side, end_idx))
+            ) {
+                gizmos.line(start, end, color);
             }
         }
     }
