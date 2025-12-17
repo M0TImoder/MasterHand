@@ -2,6 +2,7 @@ import cv2
 import mediapipe as mp
 import socket
 import json
+import math
 
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
@@ -16,6 +17,8 @@ server_address = ('127.0.0.1', 5005)
 
 cap = cv2.VideoCapture(0)
 
+pinch_state = {'Right': False, 'Left': False}
+
 while cap.isOpened():
     success, image = cap.read()
     if not success:
@@ -26,6 +29,7 @@ while cap.isOpened():
     results = hands.process(image_rgb)
 
     hand_data_list = []
+    snap_detected = False
 
     if results.multi_hand_landmarks:
         for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
@@ -48,17 +52,35 @@ while cap.isOpened():
                 'landmarks': landmark_list
             })
             
-            # 画面描画
+            # 指パッチン判定
+            th = hand_landmarks.landmark[4]
+            mi = hand_landmarks.landmark[12]
+            
+            dist_sq = (th.x - mi.x)**2 + (th.y - mi.y)**2 + (th.z - mi.z)**2
+            
+            threshold_sq = 0.002 
+
+            if dist_sq < threshold_sq:
+                # くっついている
+                if not pinch_state.get(handedness, False):
+                    # 離れた状態からくっついた瞬間 -> スナップ検知
+                    snap_detected = True
+                    pinch_state[handedness] = True
+            else:
+                # 離れている
+                pinch_state[handedness] = False
+
             mp_drawing.draw_landmarks(
                 image,
                 hand_landmarks,
                 mp_hands.HAND_CONNECTIONS
             )
 
-    # 手が見つかったらまとめて送信
     if hand_data_list:
-        # 構造: { "hands": [ {右手データ}, {左手データ} ] }
-        data = json.dumps({'hands': hand_data_list})
+        data = json.dumps({
+            'hands': hand_data_list,
+            'snap': snap_detected # スナップ情報を追加
+        })
         sock.sendto(data.encode('utf-8'), server_address)
 
     cv2.imshow('MasterHand Vision', image)
