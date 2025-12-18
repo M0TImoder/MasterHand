@@ -40,6 +40,21 @@ struct HandPoint {
 #[derive(Resource)]
 struct UdpConnection(UdpSocket);
 
+#[derive(Resource)]
+struct HandMaterials {
+    right: Handle<StandardMaterial>,
+    left: Handle<StandardMaterial>,
+}
+
+#[derive(Resource, Default)]
+struct HandPresence {
+    last_seen_right: f32,
+    last_seen_left: f32,
+}
+
+// 手が消えるまでの猶予時間(秒)
+const FADE_TIMEOUT: f32 = 0.5;
+
 fn main() {
     let socket = UdpSocket::bind("127.0.0.1:5005").expect("Bind failed");
     socket.set_nonblocking(true).expect("Nonblocking failed");
@@ -48,6 +63,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
         .insert_resource(UdpConnection(socket))
+        .insert_resource(HandPresence::default())
         .add_systems(Startup, setup)
         .add_systems(Update, update_hands_and_spawn)
         .run();
@@ -59,7 +75,6 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut gizmo_config: ResMut<GizmoConfigStore>,
 ) {
-    // ワイヤーを見やすくする設定
     let (config, _) = gizmo_config.config_mut::<DefaultGizmoConfigGroup>();
     config.depth_bias = -1.0;
     config.line_width = 3.0;
@@ -98,31 +113,26 @@ fn setup(
         Collider::cuboid(15.0, 0.01, 15.0), 
     ));
 
-    // 最初の箱
-    commands.spawn((
-        PbrBundle {
-            mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
-            material: materials.add(Color::srgb(0.8, 0.7, 0.6)),
-            transform: Transform::from_xyz(0.0, 0.0, 0.0),
-            ..default()
-        },
-        RigidBody::Dynamic,
-        Collider::cuboid(0.5, 0.5, 0.5),
-        Restitution::coefficient(0.7),
-    ));
-
-    // 手の関節
-    let sphere_mesh = meshes.add(Sphere::new(0.08));
     let right_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.0, 0.8, 1.0),
+        base_color: Color::srgba(0.0, 0.8, 1.0, 1.0),
         emissive: LinearRgba::new(0.0, 0.8, 1.0, 1.0),
+        alpha_mode: AlphaMode::Blend,
         ..default()
     });
+    
     let left_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.0, 0.8),
+        base_color: Color::srgba(1.0, 0.0, 0.8, 1.0),
         emissive: LinearRgba::new(1.0, 0.0, 0.8, 1.0),
+        alpha_mode: AlphaMode::Blend,
         ..default()
     });
+
+    commands.insert_resource(HandMaterials {
+        right: right_mat.clone(),
+        left: left_mat.clone(),
+    });
+
+    let sphere_mesh = meshes.add(Sphere::new(0.08));
 
     let sides = [
         (HandSide::Right, right_mat),
@@ -141,13 +151,12 @@ fn setup(
                 HandPoint { id: i, side: side },
                 RigidBody::KinematicPositionBased,
                 Collider::ball(0.1),
+                Friction::coefficient(2.0),
             ));
         }
     }
 }
 
-// MediaPipeの定義する「骨のつながり」リスト
-// (親のID, 子のID)
 const HAND_CONNECTIONS: &[(usize, usize)] = &[
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -161,6 +170,8 @@ fn update_hands_and_spawn(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    hand_mats: Res<HandMaterials>,
+    mut hand_presence: ResMut<HandPresence>,
     socket_res: Res<UdpConnection>,
     mut query: Query<(&HandPoint, &mut Transform)>,
     mut gizmos: Gizmos,
@@ -168,8 +179,8 @@ fn update_hands_and_spawn(
 ) {
     let mut buf = [0; 65536];
     let mut latest_packet: Option<HandPacket> = None;
+    let current_time = time.elapsed_seconds();
 
-    // バッファにあるデータを全て吸い出す
     while let Ok((amt, _src)) = socket_res.0.recv_from(&mut buf) {
         let valid_data = &buf[..amt];
         if let Ok(packet) = serde_json::from_slice::<HandPacket>(valid_data) {
@@ -177,12 +188,17 @@ fn update_hands_and_spawn(
         }
     }
 
-    if let Some(packet) = latest_packet {
-        
-        // スナップ検知で箱を生成
+    if let Some(packet) = &latest_packet {
+        if packet.hands.iter().any(|h| h.label == "Right") {
+            hand_presence.last_seen_right = current_time;
+        }
+        if packet.hands.iter().any(|h| h.label == "Left") {
+            hand_presence.last_seen_left = current_time;
+        }
+
         if packet.snap {
             let rand_x = (time.elapsed_seconds() * 10.0).sin() * 5.0;
-            let box_size = 5.0; 
+            let box_size = 5.0;
             commands.spawn((
                 PbrBundle {
                     mesh: meshes.add(Cuboid::new(box_size, box_size, box_size)),
@@ -191,13 +207,13 @@ fn update_hands_and_spawn(
                     ..default()
                 },
                 RigidBody::Dynamic,
-                // コライダは半分のサイズを指定
                 Collider::cuboid(box_size / 2.0, box_size / 2.0, box_size / 2.0),
-                Restitution::coefficient(0.5),
+                Restitution::coefficient(0.1),
+                Friction::coefficient(1.0),
+                ColliderMassProperties::Density(5.0),
             ));
         }
 
-        // 座標更新処理
         for (point, mut transform) in query.iter_mut() {
             let target_hand_data = packet.hands.iter().find(|h| {
                 match point.side {
@@ -234,6 +250,31 @@ fn update_hands_and_spawn(
         }
     }
 
+    // 表示状態の判定
+    let show_right = (current_time - hand_presence.last_seen_right) < FADE_TIMEOUT;
+    let show_left = (current_time - hand_presence.last_seen_left) < FADE_TIMEOUT;
+
+    // マテリアルの透明度
+    if let Some(mat) = materials.get_mut(&hand_mats.right) {
+        if show_right {
+            mat.base_color.set_alpha(1.0);
+            mat.emissive = LinearRgba::new(0.0, 0.8, 1.0, 1.0);
+        } else {
+            mat.base_color.set_alpha(0.1);
+            mat.emissive = LinearRgba::new(0.0, 0.1, 0.15, 1.0);
+        }
+    }
+    if let Some(mat) = materials.get_mut(&hand_mats.left) {
+        if show_left {
+            mat.base_color.set_alpha(1.0);
+            mat.emissive = LinearRgba::new(1.0, 0.0, 0.8, 1.0);
+        } else {
+            mat.base_color.set_alpha(0.1);
+            mat.emissive = LinearRgba::new(0.15, 0.0, 0.1, 1.0);
+        }
+    }
+
+    // ワイヤー描画
     let mut current_positions: HashMap<(HandSide, usize), Vec3> = HashMap::new();
 
     for (point, transform) in query.iter() {
@@ -243,10 +284,16 @@ fn update_hands_and_spawn(
     }
 
     for side in [HandSide::Right, HandSide::Left] {
-        let color = if side == HandSide::Right { 
-            Color::srgb(0.0, 1.0, 1.0) 
+        let (is_visible, base_color) = if side == HandSide::Right { 
+            (show_right, Color::srgba(0.0, 1.0, 1.0, 1.0))
         } else { 
-            Color::srgb(1.0, 0.0, 1.0) 
+            (show_left, Color::srgba(1.0, 0.0, 1.0, 1.0))
+        };
+
+        let color = if is_visible {
+            base_color
+        } else {
+            base_color.with_alpha(0.1)
         };
 
         for &(start_idx, end_idx) in HAND_CONNECTIONS {
