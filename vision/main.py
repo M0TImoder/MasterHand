@@ -2,6 +2,7 @@ import cv2
 import mediapipe as mp
 import socket
 import json
+import math
 
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
@@ -16,9 +17,36 @@ server_address = ('127.0.0.1', 5005)
 
 cap = cv2.VideoCapture(0)
 
-# 状態管理
 pinch_state = {'Right': False, 'Left': False}
 prev_middle_y = {'Right': 0.0, 'Left': 0.0}
+
+def get_gesture(landmarks):
+    # 手首
+    wrist = landmarks[0]
+    
+    # 指先とMCP(付け根)のインデックス
+    finger_tips = [8, 12, 16, 20]
+    finger_mcps = [5, 9, 13, 17]
+    
+    folded_count = 0
+    for tip_idx, mcp_idx in zip(finger_tips, finger_mcps):
+        tip = landmarks[tip_idx]
+        mcp = landmarks[mcp_idx]
+        
+        # 手首からの距離の2乗
+        dist_tip = (tip.x - wrist.x)**2 + (tip.y - wrist.y)**2 + (tip.z - wrist.z)**2
+        dist_mcp = (mcp.x - wrist.x)**2 + (mcp.y - wrist.y)**2 + (mcp.z - wrist.z)**2
+        
+        # 指先の方が手首に近い＝折れ曲がっている
+        if dist_tip < dist_mcp:
+            folded_count += 1
+            
+    if folded_count >= 3:
+        return "Fist"
+    elif folded_count == 0:
+        return "Open"
+    else:
+        return "Neutral"
 
 while cap.isOpened():
     success, image = cap.read()
@@ -46,35 +74,32 @@ while cap.isOpened():
                     'z': lm.z
                 })
             
+            gesture = get_gesture(hand_landmarks.landmark)
+
             hand_data_list.append({
                 'label': handedness,
-                'landmarks': landmark_list
+                'landmarks': landmark_list,
+                'gesture': gesture
             })
             
-            # スナップ判定
-            th = hand_landmarks.landmark[4]  # 親指
-            mi = hand_landmarks.landmark[12] # 中指
+            th = hand_landmarks.landmark[4]
+            mi = hand_landmarks.landmark[12]
             
-            # 1. 距離判定
             dist_sq = (th.x - mi.x)**2 + (th.y - mi.y)**2 + (th.z - mi.z)**2
-            threshold_sq = 0.004 # 判定閾値
+            threshold_sq = 0.004
             
             is_pinching = dist_sq < threshold_sq
 
-            # 2. 速度判定
             current_y = mi.y
-            # 前フレームとの差分絶対値
             velocity = abs(current_y - prev_middle_y.get(handedness, current_y))
-            # 速度閾値
             velocity_threshold = 0.04 
 
             if pinch_state.get(handedness, False):
                 if not is_pinching:
                     if velocity > velocity_threshold:
                         snap_detected = True
-                        print(f"Snap Detected! Hand: {handedness}, Velocity: {velocity:.4f}")
+                        print(f"Snap Detected! Hand: {handedness}")
             
-            # 状態更新
             pinch_state[handedness] = is_pinching
             prev_middle_y[handedness] = current_y
 

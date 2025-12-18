@@ -16,6 +16,8 @@ struct Landmark {
 struct OneHand {
     label: String,
     landmarks: Vec<Landmark>,
+    #[serde(default)]
+    gesture: String, 
 }
 
 #[derive(Deserialize, Debug)]
@@ -37,6 +39,9 @@ struct HandPoint {
     side: HandSide,
 }
 
+#[derive(Component)]
+struct SpawnedBox; 
+
 #[derive(Resource)]
 struct UdpConnection(UdpSocket);
 
@@ -52,7 +57,6 @@ struct HandPresence {
     last_seen_left: f32,
 }
 
-// 手が消えるまでの猶予時間(秒)
 const FADE_TIMEOUT: f32 = 0.5;
 
 fn main() {
@@ -65,7 +69,7 @@ fn main() {
         .insert_resource(UdpConnection(socket))
         .insert_resource(HandPresence::default())
         .add_systems(Startup, setup)
-        .add_systems(Update, update_hands_and_spawn)
+        .add_systems(Update, update_hands_and_physics)
         .run();
 }
 
@@ -79,13 +83,11 @@ fn setup(
     config.depth_bias = -1.0;
     config.line_width = 3.0;
 
-    // カメラ位置
     commands.spawn(Camera3dBundle {
         transform: Transform::from_xyz(0.0, 10.0, 20.0).looking_at(Vec3::ZERO, Vec3::Y),
         ..default()
     });
 
-    // ライト
     commands.spawn(PointLightBundle {
         point_light: PointLight {
             intensity: 2000.0,
@@ -97,7 +99,6 @@ fn setup(
         ..default()
     });
 
-    // 床
     commands.spawn((
         PbrBundle {
             mesh: meshes.add(Plane3d::default().mesh().size(30.0, 30.0)),
@@ -166,14 +167,15 @@ const HAND_CONNECTIONS: &[(usize, usize)] = &[
     (5, 9), (9, 13), (13, 17)
 ];
 
-fn update_hands_and_spawn(
+fn update_hands_and_physics(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     hand_mats: Res<HandMaterials>,
     mut hand_presence: ResMut<HandPresence>,
     socket_res: Res<UdpConnection>,
-    mut query: Query<(&HandPoint, &mut Transform)>,
+    mut hand_query: Query<(&HandPoint, &mut Transform)>,
+    mut box_query: Query<(&mut ExternalForce, &Transform), (With<SpawnedBox>, Without<HandPoint>)>,
     mut gizmos: Gizmos,
     time: Res<Time>, 
 ) {
@@ -211,10 +213,16 @@ fn update_hands_and_spawn(
                 Restitution::coefficient(0.1),
                 Friction::coefficient(1.0),
                 ColliderMassProperties::Density(5.0),
+                ExternalForce::default(), 
+                SpawnedBox, 
             ));
         }
 
-        for (point, mut transform) in query.iter_mut() {
+        let mut hand_centers: HashMap<String, Vec3> = HashMap::new();
+        let mut hand_normals: HashMap<String, Vec3> = HashMap::new();
+        let mut hand_gestures: HashMap<String, String> = HashMap::new();
+
+        for (point, mut transform) in hand_query.iter_mut() {
             let target_hand_data = packet.hands.iter().find(|h| {
                 match point.side {
                     HandSide::Right => h.label == "Right",
@@ -223,9 +231,15 @@ fn update_hands_and_spawn(
             });
 
             if let Some(hand_data) = target_hand_data {
+                if point.id == 9 { 
+                    hand_gestures.insert(hand_data.label.clone(), hand_data.gesture.clone());
+                }
+
                 let mut depth_offset = 0.0;
                 let wrist = hand_data.landmarks.iter().find(|l| l.id == 0);
                 let middle_mcp = hand_data.landmarks.iter().find(|l| l.id == 9);
+                let pinky_mcp = hand_data.landmarks.iter().find(|l| l.id == 17);
+                let index_mcp = hand_data.landmarks.iter().find(|l| l.id == 5);
 
                 if let (Some(w), Some(m)) = (wrist, middle_mcp) {
                     let dx = w.x - m.x;
@@ -245,16 +259,83 @@ fn update_hands_and_spawn(
                     let smooth_factor = 40.0 * time.delta_seconds(); 
                     let t = smooth_factor.clamp(0.0, 1.0);
                     transform.translation = transform.translation.lerp(target_pos, t);
+
+                    if point.id == 9 {
+                        hand_centers.insert(hand_data.label.clone(), transform.translation);
+                    }
                 }
+
+                if point.id == 0 {
+                    if let (Some(w), Some(i), Some(p)) = (wrist, index_mcp, pinky_mcp) {
+                         let to_index = Vec3::new(i.x - w.x, w.y - i.y, i.z - w.z);
+                         let to_pinky = Vec3::new(p.x - w.x, w.y - p.y, p.z - w.z);
+                         
+                         let mut normal = if hand_data.label == "Right" {
+                             to_index.cross(to_pinky).normalize_or_zero()
+                         } else {
+                             to_pinky.cross(to_index).normalize_or_zero()
+                         };
+                         
+                         normal.y *= -1.0; 
+                         hand_normals.insert(hand_data.label.clone(), normal);
+                    }
+                }
+            }
+        }
+
+        let mut total_force_field = HashMap::new(); 
+
+        for (label, gesture) in &hand_gestures {
+            if gesture == "Fist" {
+                if let Some(center) = hand_centers.get(label) {
+                    for (_box_force, box_transform) in box_query.iter() {
+                        let dir = *center - box_transform.translation;
+                        let dist_sq = dir.length_squared().max(1.0);
+                        let force_mag = 50000.0 / dist_sq; 
+                        let force = dir.normalize_or_zero() * force_mag;
+                        
+                        let entity_ptr = box_transform as *const _ as usize; 
+                        total_force_field.entry(entity_ptr).and_modify(|f: &mut Vec3| *f += force).or_insert(force);
+                    }
+                    gizmos.sphere(*center, Quat::IDENTITY, 1.0, Color::srgb(1.0, 0.0, 0.0));
+                }
+            }
+        }
+
+        let right_open = hand_gestures.get("Right").map(|g| g == "Open").unwrap_or(false);
+        let left_open = hand_gestures.get("Left").map(|g| g == "Open").unwrap_or(false);
+
+        if right_open && left_open {
+             if let (Some(n_r), Some(n_l)) = (hand_normals.get("Right"), hand_normals.get("Left")) {
+                 if n_r.dot(*n_l) > 0.5 { 
+                     let avg_dir = (*n_r + *n_l).normalize();
+                     let wind_force = avg_dir * 1500.0; 
+
+                     for (_box_force, box_transform) in box_query.iter() {
+                         let entity_ptr = box_transform as *const _ as usize;
+                         total_force_field.entry(entity_ptr).and_modify(|f: &mut Vec3| *f += wind_force).or_insert(wind_force);
+                     }
+                     
+                     if let Some(center) = hand_centers.get("Right") {
+                         gizmos.arrow(*center, *center + avg_dir * 5.0, Color::srgb(0.0, 1.0, 0.0));
+                     }
+                 }
+             }
+        }
+
+        for (mut box_force, box_transform) in box_query.iter_mut() {
+            let entity_ptr = box_transform as *const _ as usize;
+            if let Some(force) = total_force_field.get(&entity_ptr) {
+                box_force.force = *force;
+            } else {
+                box_force.force = Vec3::ZERO;
             }
         }
     }
 
-    // 表示状態の判定
     let show_right = (current_time - hand_presence.last_seen_right) < FADE_TIMEOUT;
     let show_left = (current_time - hand_presence.last_seen_left) < FADE_TIMEOUT;
 
-    // マテリアルの透明度
     if let Some(mat) = materials.get_mut(&hand_mats.right) {
         if show_right {
             mat.base_color.set_alpha(1.0);
@@ -274,10 +355,9 @@ fn update_hands_and_spawn(
         }
     }
 
-    // ワイヤー描画
     let mut current_positions: HashMap<(HandSide, usize), Vec3> = HashMap::new();
 
-    for (point, transform) in query.iter() {
+    for (point, transform) in hand_query.iter() {
         if transform.translation.y > -50.0 {
             current_positions.insert((point.side, point.id), transform.translation);
         }
